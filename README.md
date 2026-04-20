@@ -140,7 +140,3 @@ Open Claude Code in the project directory and run:
 ```
 
 All five servers should show as connected.
-
-## Workshop context
-
-This project is part of the [LoopMe Claude Code Masterclass](https://realaization.com). It is intentionally scoped to stay small, legible, and demo-friendly — not to be a production campaign ops platform.
