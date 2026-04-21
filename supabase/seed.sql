@@ -1,7 +1,7 @@
 -- =============================================================================
 -- Campaign Investigation Tracker — Seed Data
 -- =============================================================================
--- Designed for the LoopMe Claude Code Masterclass workshop demo.
+-- Designed for the NeonOne Claude Code Masterclass workshop demo.
 -- Small, curated, deterministic. Supports the full investigation workflow.
 -- =============================================================================
 
