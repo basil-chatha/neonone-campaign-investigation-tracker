@@ -1,0 +1,216 @@
+name: PR Build & Root-Cause Analysis
+
+# Runs backend + frontend builds on every PR. On failure, invokes Claude Code Action
+# to produce a root-cause analysis comment that delegates to parallel subagents for
+# log forensics, diff analysis, git history, and environmental drift.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+  actions: read
+
+concurrency:
+  group: build-rca-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare artifact dir
+        run: mkdir -p /tmp/ci-artifacts
+
+      # --------------------------------------------------------------------
+      # Backend (FastAPI + uv + pytest)
+      # --------------------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Backend — install deps
+        id: backend_install
+        working-directory: backend
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          uv venv
+          uv pip install -r requirements.txt 2>&1 | tee /tmp/ci-artifacts/backend-install.log
+
+      - name: Backend — run pytest
+        id: backend_tests
+        if: steps.backend_install.outcome == 'success'
+        working-directory: backend
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          uv run pytest -q 2>&1 | tee /tmp/ci-artifacts/backend-test.log
+
+      # --------------------------------------------------------------------
+      # Frontend (React + Vite + Bun)
+      # --------------------------------------------------------------------
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Frontend — install deps
+        id: frontend_install
+        working-directory: frontend
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          bun install --frozen-lockfile 2>&1 | tee /tmp/ci-artifacts/frontend-install.log
+
+      - name: Frontend — build
+        id: frontend_build
+        if: steps.frontend_install.outcome == 'success'
+        working-directory: frontend
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          bun run build 2>&1 | tee /tmp/ci-artifacts/frontend-build.log
+
+      # --------------------------------------------------------------------
+      # Aggregate outcomes
+      # --------------------------------------------------------------------
+      - name: Determine failures
+        id: verdict
+        run: |
+          failed=()
+          [[ "${{ steps.backend_install.outcome }}"  == "failure" ]] && failed+=("backend-install")
+          [[ "${{ steps.backend_tests.outcome }}"    == "failure" ]] && failed+=("backend-tests")
+          [[ "${{ steps.frontend_install.outcome }}" == "failure" ]] && failed+=("frontend-install")
+          [[ "${{ steps.frontend_build.outcome }}"   == "failure" ]] && failed+=("frontend-build")
+
+          if [[ ${#failed[@]} -eq 0 ]]; then
+            echo "has_failure=false" >> "$GITHUB_OUTPUT"
+            echo "failed_steps=" >> "$GITHUB_OUTPUT"
+            echo "No build/test failures — skipping RCA."
+          else
+            echo "has_failure=true" >> "$GITHUB_OUTPUT"
+            ( IFS=','; echo "failed_steps=${failed[*]}" ) >> "$GITHUB_OUTPUT"
+            echo "Failed steps: ${failed[*]}"
+          fi
+
+          ls -la /tmp/ci-artifacts || true
+
+      - name: Upload CI logs as artifact
+        if: steps.verdict.outputs.has_failure == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-pr-${{ github.event.pull_request.number }}
+          path: /tmp/ci-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # --------------------------------------------------------------------
+      # Root-cause analysis via Claude Code Action (only on failure).
+      # The `prompt` directs Claude to spawn parallel subagents (log, diff,
+      # history, env) before synthesizing a single PR comment.
+      # --------------------------------------------------------------------
+      - name: Claude root-cause analysis
+        if: steps.verdict.outputs.has_failure == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          claude_args: |
+            --max-turns 25
+            --model claude-opus-4-7
+            --allowedTools "Bash,Read,Grep,Glob,Task"
+          prompt: |
+            You are running inside a GitHub Action on pull request #${{ github.event.pull_request.number }}. The following CI steps failed: `${{ steps.verdict.outputs.failed_steps }}`. Your job is to produce a single PR comment that delivers a rigorous **root-cause analysis** — not a surface-level restatement of the error. Your final message IS the PR comment; do not emit anything else.
+
+            ## Environment you can rely on
+
+            - `$GITHUB_WORKSPACE` contains the checked-out PR branch.
+            - CI logs (some may be absent if that step was skipped):
+              - `/tmp/ci-artifacts/backend-install.log`
+              - `/tmp/ci-artifacts/backend-test.log`
+              - `/tmp/ci-artifacts/frontend-install.log`
+              - `/tmp/ci-artifacts/frontend-build.log`
+            - `gh` CLI is authenticated. Useful calls: `gh pr view ${{ github.event.pull_request.number }}`, `gh pr diff ${{ github.event.pull_request.number }}`, `gh pr checks ${{ github.event.pull_request.number }}`, `gh run list`, `gh run view <id> --log`.
+            - Git history is available. Use `git log --oneline -30`, `git log origin/main..HEAD --oneline`, `git blame`, `git show <sha>`.
+            - Allowed tools: Bash, Read, Grep, Glob, Task.
+
+            ## Method — follow this exactly
+
+            ### Phase 1: Orient (do this first, serially)
+
+            1. `ls /tmp/ci-artifacts/` to see which logs exist. The set of present logs tells you which steps ran and which failed.
+            2. Tail each present log (`tail -n 200`) to get the proximate failure signature. Note file paths, line numbers, error classes, and exit codes verbatim.
+            3. `gh pr view ${{ github.event.pull_request.number }} --json title,body,baseRefName,headRefName,commits` to learn the PR's scope and base branch.
+
+            Do not jump to conclusions yet. The log's top-line error is the **proximate** cause; the root cause is almost always a change somewhere else.
+
+            ### Phase 2: Parallel investigation via subagents
+
+            Spawn **four subagents in a single message** using the Task tool (one message, four tool calls — this is required for parallelism). Give each one the concrete log excerpts and PR number it needs. The four angles:
+
+            **Subagent A — Log forensics.** Inputs: the raw failing log contents. Job: extract the exact error (error class, message, file:line, stack frame closest to user code), identify the failing command and its exit code, distinguish the first failure from cascade failures, and quote the 5–15 most load-bearing lines. Return: a precise failure signature, not a summary.
+
+            **Subagent B — PR diff analysis.** Inputs: PR number ${{ github.event.pull_request.number }}. Job: run `gh pr diff ${{ github.event.pull_request.number }}` and `git diff origin/${BASE}...HEAD --stat` (resolve BASE from `gh pr view`). Enumerate every file changed. For each file plausibly connected to the failure signature from A, quote the specific hunks. Look specifically for: renamed symbols, changed function signatures, moved files, deleted exports, new imports of non-existent modules, schema/model changes without corresponding migration or fixture updates, test files that reference code the diff modified. Return: ranked list of diff hunks most likely to be causal, with reasoning.
+
+            **Subagent C — History / bisect.** Inputs: failure signature from A. Job: `git log --oneline origin/main..HEAD` to list PR commits; `git log --oneline -50` on main for context. For each PR commit, reason about whether it could have introduced the failure (use `git show <sha>` on suspects). If the failure references a specific file, run `git blame` on the relevant lines to identify the commit that last touched them. Check whether main is currently green (`gh run list --branch main --limit 5`). Return: the specific commit SHA you believe introduced the regression, or "cannot localize" with what's missing.
+
+            **Subagent D — Environmental drift.** Inputs: PR number. Job: check `backend/requirements.txt`, `backend/pyproject.toml` (if present), `frontend/package.json`, `frontend/bun.lock`, `.python-version`, any `.tool-versions` or `.nvmrc`, and workflow YAML for tool versions. Diff the lockfiles between base and HEAD (`git diff origin/${BASE}...HEAD -- frontend/bun.lock backend/requirements.txt`). Look for: lockfile regenerated without matching manifest change, manifest changed without lockfile update, Python/Node/Bun version bumps, env var references added without corresponding `.env.example` entry. Return: list of environmental deltas, each tagged as "likely causal" / "unrelated but notable" / "benign".
+
+            ### Phase 3: Synthesis
+
+            After all four subagents return, you — not a subagent — do the synthesis. Rules:
+
+            - **Proximate vs root.** State both. "pytest failed with `AttributeError: 'Campaign' has no attribute 'foo'`" is proximate. "Commit abc1234 renamed `Campaign.foo` to `Campaign.foo_id` but did not update `tests/test_campaigns.py:42` or the seed fixture" is root.
+            - **Be skeptical of first-order explanations.** If the log says "module not found", verify: does the module exist in the repo right now (`Grep`/`Glob`)? Was it renamed this PR? Is the import path correct relative to the command's cwd? Was it removed from the lockfile? Never accept the log's framing without checking.
+            - **Group correlated failures.** If backend-test and frontend-build both failed, assume one root cause until evidence proves otherwise (e.g., a shared schema file changed).
+            - **Do not fabricate.** Every commit SHA, file path, and line number in your output must come from a tool call you actually ran. If a subagent was uncertain, reflect that uncertainty in Confidence — do not launder it into false precision.
+            - **Handle the "flaky / infra" case honestly.** If nothing in the diff plausibly explains the failure and main is also red on the same signature, say so and point at infra/flake rather than inventing a code cause.
+
+            ### Phase 4: Write the comment
+
+            Output exactly this structure, in GitHub-flavored markdown, under 2000 words total. No preamble, no sign-off.
+
+            ## Build Failure Root-Cause Analysis
+
+            ### TL;DR
+            1–2 sentences. Name the root cause and the fix direction. No hedging here — save nuance for Confidence.
+
+            ### What failed
+            Which CI step(s). The proximate error with file:line. A quoted excerpt (fenced code block) of the 3–10 most load-bearing log lines. Exit code if known.
+
+            ### Root cause
+            The *why*. Which commit (SHA + short message), which hunk (quote the diff), which contract/invariant it broke. Connect the diff to the failure signature with an explicit causal chain: "commit X changed Y, which is called from Z, which is what the failing test asserts on." If the cause is in a file the PR did NOT touch, explain the upstream assumption that broke.
+
+            ### Secondary factors
+            Only if present: stale lockfile, env drift, dependency version mismatch, cascade failures, pre-existing flake. Omit this section entirely if none apply — do not write "none".
+
+            ### Suggested fix
+            Concrete and patch-level. Prefer a fenced ```diff``` block if the fix is small. Otherwise, numbered steps naming exact files and changes. Do not suggest "investigate further" — this section is for actions.
+
+            ### Confidence
+            High / Medium / Low. One sentence on what drives it. One sentence on what evidence would raise it (e.g., "running the failing test locally after the suggested patch would confirm").
+
+            Begin Phase 1 now.
+
+      # --------------------------------------------------------------------
+      # Fail the job so the PR check goes red if anything actually broke.
+      # This runs AFTER the Claude step so the comment is posted first.
+      # --------------------------------------------------------------------
+      - name: Enforce build failure
+        if: steps.verdict.outputs.has_failure == 'true'
+        run: |
+          echo "::error::Build/test failed in: ${{ steps.verdict.outputs.failed_steps }}. See Claude's root-cause analysis in PR comments."
+          exit 1
