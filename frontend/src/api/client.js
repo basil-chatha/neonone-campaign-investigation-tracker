@@ -31,7 +31,7 @@ async function fetchApi(path) {
 /**
  * Fetch all campaigns.
  */
-export async function getCampaigns() {
+export async function getAllCampaigns() {
   return fetchApi('/campaigns');
 }
 
