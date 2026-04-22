@@ -1,12 +1,15 @@
 """
 SQLAlchemy ORM models for the Campaign Investigation Tracker.
+
+Only the campaign-related models are mapped here — the investigation
+workflow models (investigations, investigation_evidence, ai_runs) will
+be built during the workshop.
 """
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, DateTime, Boolean, ForeignKey, Text,
-    Numeric,
 )
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
 
@@ -14,6 +17,10 @@ Base = declarative_base()
 # TODO [Step 4 — Day 1 / Module 04 — AIDLC]: Add SQLAlchemy relationship from Campaign
 #   to CampaignHealth (e.g. `health_snapshots = relationship("CampaignHealth", back_populates=...)`)
 #   so the campaign detail endpoint can eagerly load health data.
+
+# TODO [Step 5 — Day 1 / Module 05 — Workflow Deep Dive]: Add SQLAlchemy relationship from Campaign
+#   to Investigation (e.g. `investigations = relationship("Investigation", back_populates=...)`)
+#   so the campaign detail page can show associated investigations.
 
 
 class Campaign(Base):
@@ -23,7 +30,7 @@ class Campaign(Base):
     id = Column(String(50), primary_key=True, index=True)
     campaign_code = Column(String(50), unique=True, index=True)
     name = Column(String(255))
-    advertiser_name = Column(String(255))
+    advertiser = Column(String(255))
     status = Column(String(50))
     objective = Column(String(255))
     channel = Column(String(100))
@@ -34,10 +41,6 @@ class Campaign(Base):
     region = Column(String(100))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    investigations = relationship(
-        "Investigation", back_populates="campaign", cascade="all, delete-orphan"
-    )
 
 
 class CampaignHealth(Base):
@@ -60,76 +63,26 @@ class CampaignHealth(Base):
     delivery_note = Column(Text)
 
 
-class Investigation(Base):
-    """Investigation table — structured triage record against a campaign."""
-    __tablename__ = "investigations"
-
-    id = Column(String(50), primary_key=True, index=True)
-    campaign_id = Column(String(50), ForeignKey("campaigns.id"), index=True)
-    source_snapshot_id = Column(String(50), ForeignKey("campaign_health.id"))
-    issue_type = Column(String(100))
-    severity = Column(String(50))
-    status = Column(String(50))
-    owner_name = Column(String(255))
-    question = Column(Text)
-    hypothesis = Column(Text)
-    next_action = Column(Text)
-    resolution_summary = Column(Text)
-    opened_at = Column(DateTime)
-    updated_at = Column(DateTime)
-    resolved_at = Column(DateTime)
-
-    campaign = relationship("Campaign", back_populates="investigations")
-    evidence = relationship(
-        "InvestigationEvidence",
-        back_populates="investigation",
-        order_by="InvestigationEvidence.sort_order",
-        cascade="all, delete-orphan",
-    )
-    ai_runs = relationship(
-        "AiRun",
-        back_populates="investigation",
-        cascade="all, delete-orphan",
-    )
+# TODO [Step 2 — Day 1 / Module 02 — Economics]: Add the AiRun ORM model.
+#   Maps to the `ai_runs` table. Columns: id, investigation_id (FK → investigations.id),
+#   model, task_type, input_tokens, output_tokens, estimated_cost_usd, latency_ms,
+#   prompt_summary, recommendation_summary, created_at.
+#   This gives the product a concrete place to log AI activity for economics discussion.
+#   Keep it intentionally minimal — enough to log model, latency, token/cost estimate,
+#   and which investigation it relates to.
 
 
-class InvestigationEvidence(Base):
-    """Typed evidence rows attached to an investigation."""
-    __tablename__ = "investigation_evidence"
-
-    id = Column(String(50), primary_key=True, index=True)
-    investigation_id = Column(String(50), ForeignKey("investigations.id"), index=True)
-    snapshot_id = Column(String(50), ForeignKey("campaign_health.id"))
-    evidence_type = Column(String(50))
-    title = Column(String(255))
-    summary = Column(Text)
-    metric_name = Column(String(100))
-    metric_value = Column(Numeric(12, 4))
-    metric_unit = Column(String(50))
-    source_label = Column(String(255))
-    source_ref = Column(String(255))
-    captured_at = Column(DateTime)
-    captured_by = Column(String(255))
-    is_key_evidence = Column(Boolean, default=False)
-    sort_order = Column(Integer)
-
-    investigation = relationship("Investigation", back_populates="evidence")
+# TODO [Step 5 — Day 1 / Module 05 — Workflow Deep Dive]: Add the Investigation ORM model.
+#   Maps to the `investigations` table. Columns: id, campaign_id (FK → campaigns.id),
+#   source_snapshot_id (FK → campaign_health.id), issue_type, severity, status, owner_name,
+#   question, hypothesis, next_action, resolution_summary, opened_at, updated_at, resolved_at.
+#   Core fields to capture live: question, hypothesis, owner, next_action.
+#   Status workflow: New → Investigating → Needs Action → Resolved.
 
 
-class AiRun(Base):
-    """Log row capturing a single AI model invocation tied to an investigation."""
-    __tablename__ = "ai_runs"
-
-    id = Column(String(50), primary_key=True, index=True)
-    investigation_id = Column(String(50), ForeignKey("investigations.id"), index=True)
-    model = Column(String(100))
-    task_type = Column(String(50))
-    input_tokens = Column(Integer)
-    output_tokens = Column(Integer)
-    estimated_cost_usd = Column(Numeric(10, 4))
-    latency_ms = Column(Integer)
-    prompt_summary = Column(Text)
-    recommendation_summary = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    investigation = relationship("Investigation", back_populates="ai_runs")
+# TODO [Step 5 — Day 1 / Module 05 — Workflow Deep Dive]: Add the InvestigationEvidence ORM model.
+#   Maps to the `investigation_evidence` table. Columns: id, investigation_id (FK → investigations.id),
+#   snapshot_id (FK → campaign_health.id), evidence_type, title, summary, metric_name,
+#   metric_value, metric_unit, source_label, source_ref, captured_at, captured_by,
+#   is_key_evidence, sort_order.
+#   Typed evidence: metrics, notes, QA checks, recommendations.
